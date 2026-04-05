@@ -1,0 +1,2 @@
+config X_I2C_RUST
+    bool

@@ -1,0 +1,4 @@
+# devices Kconfig
+source char/Kconfig
+source i2c/Kconfig
+source timer/Kconfig

@@ -1,0 +1,13 @@
+# GPGPU 设备的 Kconfig 配置
+#
+# 这个文件定义了 GPGPU 设备的编译选项和依赖关系
+# QEMU 使用 Kconfig 系统来管理设备的条件编译
+
+config GPGPU
+    bool
+    # 如果启用了 PCI_DEVICES，默认编译此设备
+    default y if PCI_DEVICES
+    # 依赖 PCI 总线支持和无故障的 MSI 实现
+    depends on PCI && MSI_NONBROKEN
+    # 可选: 如果只想在测试时编译，取消上面的注释并使用:
+    # default y if TEST_DEVICES

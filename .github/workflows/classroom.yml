@@ -1,0 +1,319 @@
+name: QEMU Camp 2026 CI
+
+on:
+  push:
+    branches: [ main ]
+    paths-ignore:
+      - 'README.md'
+      - 'docs/**'
+
+env:
+  CARGO_TERM_COLOR: always
+  TZ: Asia/Shanghai
+
+jobs:
+  # ────────────────────────────────────────────────────────────
+  # CPU experiment — TCG testcase, score from result.log
+  # ────────────────────────────────────────────────────────────
+  cpu:
+    name: "CPU Experiment (TCG)"
+    runs-on: ubuntu-24.04
+    env:
+      RESULT_LOG: build/tests/gevico/tcg/riscv64-softmmu/result.log
+      TOTAL_CASES: 10
+      SCORE_PER_CASE: 10
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install dependencies
+        run: |
+          sudo sed -i 's/^Types: deb$/Types: deb deb-src/' /etc/apt/sources.list.d/ubuntu.sources
+          sudo apt-get update
+          sudo apt-get build-dep -y qemu
+          # RISC-V bare-metal cross compiler (for TCG testcases)
+          sudo mkdir -p /opt/riscv
+          wget -q https://github.com/riscv-collab/riscv-gnu-toolchain/releases/download/2025.09.28/riscv64-elf-ubuntu-24.04-gcc-nightly-2025.09.28-nightly.tar.xz -O riscv-toolchain.tar.xz
+          sudo tar -xJf riscv-toolchain.tar.xz -C /opt/riscv --strip-components=1
+          sudo chown -R $USER:$USER /opt/riscv
+          echo "/opt/riscv/bin" >> $GITHUB_PATH
+          export PATH="/opt/riscv/bin:$PATH"
+          riscv64-unknown-elf-gcc --version
+          # Rust toolchain
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+          . "$HOME/.cargo/env"
+          rustc --version
+          cargo install bindgen-cli
+
+      - name: Configure
+        run: make -f Makefile.camp configure
+
+      - name: Build
+        run: make -f Makefile.camp build
+
+      - name: Run CPU tests
+        run: |
+          make -C build check-gevico-tcg || true
+
+      - name: Calculate score
+        id: score
+        run: |
+          passed=0
+          if [ -f "$RESULT_LOG" ]; then
+            passed=$(cat "$RESULT_LOG" 2>/dev/null || echo 0)
+          fi
+          score=$((passed * SCORE_PER_CASE))
+          total=$((TOTAL_CASES * SCORE_PER_CASE))
+          echo "passed=$passed" >> "$GITHUB_OUTPUT"
+          echo "score=$score"   >> "$GITHUB_OUTPUT"
+          echo "total=$total"   >> "$GITHUB_OUTPUT"
+          echo "::notice::CPU experiment: $passed/$TOTAL_CASES cases passed, score $score/$total"
+
+      - name: Upload score
+        if: ${{ steps.score.outputs.score != '0' }}
+        run: |
+          summary=$(jq -n \
+            --arg channel "github" \
+            --argjson courseId "${{ secrets.QEMU_CAMP_2026_CPU_AUTUMN_COURSE_ID }}" \
+            --arg ext "{}" \
+            --arg name "${{ github.actor }}" \
+            --argjson score "${{ steps.score.outputs.score }}" \
+            --argjson totalScore "${{ steps.score.outputs.total }}" \
+            '{channel: $channel, courseId: $courseId, ext: $ext, name: $name, score: $score, totalScore: $totalScore}')
+          echo "$summary"
+          curl -X POST "${{ secrets.QEMU_CAMP_2026_COURSE_POST_API }}" \
+            -H "accept: application/json;charset=utf-8" \
+            -H "Content-Type: application/json" \
+            -H "token: ${{ secrets.QEMU_CAMP_2026_CPU_AUTUMN_TOKEN }}" \
+            -d "$summary" \
+            -v
+
+  # ────────────────────────────────────────────────────────────
+  # SoC experiment — QTest, score from soc-result.log
+  # ────────────────────────────────────────────────────────────
+  soc:
+    name: "SoC Experiment (QTest)"
+    runs-on: ubuntu-24.04
+    env:
+      RESULT_LOG: build/soc-result.log
+      TOTAL_CASES: 10
+      SCORE_PER_CASE: 10
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install dependencies
+        run: |
+          sudo sed -i 's/^Types: deb$/Types: deb deb-src/' /etc/apt/sources.list.d/ubuntu.sources
+          sudo apt-get update
+          sudo apt-get build-dep -y qemu
+          # RISC-V bare-metal cross compiler
+          sudo mkdir -p /opt/riscv
+          wget -q https://github.com/riscv-collab/riscv-gnu-toolchain/releases/download/2025.09.28/riscv64-elf-ubuntu-24.04-gcc-nightly-2025.09.28-nightly.tar.xz -O riscv-toolchain.tar.xz
+          sudo tar -xJf riscv-toolchain.tar.xz -C /opt/riscv --strip-components=1
+          sudo chown -R $USER:$USER /opt/riscv
+          echo "/opt/riscv/bin" >> $GITHUB_PATH
+          export PATH="/opt/riscv/bin:$PATH"
+          riscv64-unknown-elf-gcc --version
+          # Rust toolchain
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+          . "$HOME/.cargo/env"
+          rustc --version
+          cargo install bindgen-cli
+
+      - name: Configure
+        run: make -f Makefile.camp configure
+
+      - name: Build
+        run: make -f Makefile.camp build
+
+      - name: Run SoC tests
+        run: |
+          make -f Makefile.camp test-soc || true
+
+      - name: Calculate score
+        id: score
+        run: |
+          passed=0
+          if [ -f "$RESULT_LOG" ]; then
+            passed=$(cat "$RESULT_LOG" 2>/dev/null || echo 0)
+          fi
+          score=$((passed * SCORE_PER_CASE))
+          total=$((TOTAL_CASES * SCORE_PER_CASE))
+          echo "passed=$passed" >> "$GITHUB_OUTPUT"
+          echo "score=$score"   >> "$GITHUB_OUTPUT"
+          echo "total=$total"   >> "$GITHUB_OUTPUT"
+          echo "::notice::SoC experiment: $passed/$TOTAL_CASES cases passed, score $score/$total"
+
+      - name: Upload score
+        if: ${{ steps.score.outputs.score != '0' }}
+        run: |
+          summary=$(jq -n \
+            --arg channel "github" \
+            --argjson courseId "${{ secrets.QEMU_CAMP_2026_SOC_AUTUMN_COURSE_ID }}" \
+            --arg ext "{}" \
+            --arg name "${{ github.actor }}" \
+            --argjson score "${{ steps.score.outputs.score }}" \
+            --argjson totalScore "${{ steps.score.outputs.total }}" \
+            '{channel: $channel, courseId: $courseId, ext: $ext, name: $name, score: $score, totalScore: $totalScore}')
+          echo "$summary"
+          curl -X POST "${{ secrets.QEMU_CAMP_2026_COURSE_POST_API }}" \
+            -H "accept: application/json;charset=utf-8" \
+            -H "Content-Type: application/json" \
+            -H "token: ${{ secrets.QEMU_CAMP_2026_SOC_AUTUMN_TOKEN }}" \
+            -d "$summary" \
+            -v
+
+  # ────────────────────────────────────────────────────────────
+  # GPGPU experiment — QTest (QOS), 17 subtests → 100 points
+  # ────────────────────────────────────────────────────────────
+  gpgpu:
+    name: "GPGPU Experiment (QTest)"
+    runs-on: ubuntu-24.04
+    env:
+      RESULT_LOG: build/gpgpu-result.log
+      TOTAL_CASES: 17
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install dependencies
+        run: |
+          sudo sed -i 's/^Types: deb$/Types: deb deb-src/' /etc/apt/sources.list.d/ubuntu.sources
+          sudo apt-get update
+          sudo apt-get build-dep -y qemu
+          sudo mkdir -p /opt/riscv
+          wget -q https://github.com/riscv-collab/riscv-gnu-toolchain/releases/download/2025.09.28/riscv64-elf-ubuntu-24.04-gcc-nightly-2025.09.28-nightly.tar.xz -O riscv-toolchain.tar.xz
+          sudo tar -xJf riscv-toolchain.tar.xz -C /opt/riscv --strip-components=1
+          sudo chown -R $USER:$USER /opt/riscv
+          echo "/opt/riscv/bin" >> $GITHUB_PATH
+          export PATH="/opt/riscv/bin:$PATH"
+          riscv64-unknown-elf-gcc --version
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+          . "$HOME/.cargo/env"
+          rustc --version
+          cargo install bindgen-cli
+
+      - name: Configure
+        run: make -f Makefile.camp configure
+
+      - name: Build
+        run: make -f Makefile.camp build
+
+      - name: Run GPGPU tests
+        run: |
+          make -f Makefile.camp test-gpgpu || true
+
+      - name: Calculate score
+        id: score
+        run: |
+          passed=0
+          if [ -f "$RESULT_LOG" ]; then
+            passed=$(cat "$RESULT_LOG" 2>/dev/null || echo 0)
+          fi
+          score=$((passed * 100 / TOTAL_CASES))
+          echo "passed=$passed" >> "$GITHUB_OUTPUT"
+          echo "score=$score"   >> "$GITHUB_OUTPUT"
+          echo "total=100"      >> "$GITHUB_OUTPUT"
+          echo "::notice::GPGPU experiment: $passed/$TOTAL_CASES cases passed, score $score/100"
+
+      - name: Upload score
+        if: ${{ steps.score.outputs.score != '0' }}
+        run: |
+          summary=$(jq -n \
+            --arg channel "github" \
+            --argjson courseId "${{ secrets.QEMU_CAMP_2026_GPU_AUTUMN_COURSE_ID }}" \
+            --arg ext "{}" \
+            --arg name "${{ github.actor }}" \
+            --argjson score "${{ steps.score.outputs.score }}" \
+            --argjson totalScore "${{ steps.score.outputs.total }}" \
+            '{channel: $channel, courseId: $courseId, ext: $ext, name: $name, score: $score, totalScore: $totalScore}')
+          echo "$summary"
+          curl -X POST "${{ secrets.QEMU_CAMP_2026_COURSE_POST_API }}" \
+            -H "accept: application/json;charset=utf-8" \
+            -H "Content-Type: application/json" \
+            -H "token: ${{ secrets.QEMU_CAMP_2026_GPU_AUTUMN_TOKEN }}" \
+            -d "$summary" \
+            -v
+
+  # ────────────────────────────────────────────────────────────
+  # Rust experiment — 3 unit tests + 7 QTest = 10 × 10 pts
+  # ────────────────────────────────────────────────────────────
+  rust:
+    name: "Rust Experiment (Unit + QTest)"
+    runs-on: ubuntu-24.04
+    env:
+      RESULT_LOG: build/rust-result.log
+      TOTAL_CASES: 10
+      SCORE_PER_CASE: 10
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install dependencies
+        run: |
+          sudo sed -i 's/^Types: deb$/Types: deb deb-src/' /etc/apt/sources.list.d/ubuntu.sources
+          sudo apt-get update
+          sudo apt-get build-dep -y qemu
+          sudo mkdir -p /opt/riscv
+          wget -q https://github.com/riscv-collab/riscv-gnu-toolchain/releases/download/2025.09.28/riscv64-elf-ubuntu-24.04-gcc-nightly-2025.09.28-nightly.tar.xz -O riscv-toolchain.tar.xz
+          sudo tar -xJf riscv-toolchain.tar.xz -C /opt/riscv --strip-components=1
+          sudo chown -R $USER:$USER /opt/riscv
+          echo "/opt/riscv/bin" >> $GITHUB_PATH
+          export PATH="/opt/riscv/bin:$PATH"
+          riscv64-unknown-elf-gcc --version
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+          . "$HOME/.cargo/env"
+          rustc --version
+          cargo install bindgen-cli
+
+      - name: Configure
+        run: make -f Makefile.camp configure
+
+      - name: Build
+        run: make -f Makefile.camp build
+
+      - name: Run Rust tests
+        run: |
+          make -f Makefile.camp test-rust || true
+
+      - name: Calculate score
+        id: score
+        run: |
+          passed=0
+          if [ -f "$RESULT_LOG" ]; then
+            passed=$(cat "$RESULT_LOG" 2>/dev/null || echo 0)
+          fi
+          score=$((passed * SCORE_PER_CASE))
+          total=$((TOTAL_CASES * SCORE_PER_CASE))
+          echo "passed=$passed" >> "$GITHUB_OUTPUT"
+          echo "score=$score"   >> "$GITHUB_OUTPUT"
+          echo "total=$total"   >> "$GITHUB_OUTPUT"
+          echo "::notice::Rust experiment: $passed/$TOTAL_CASES cases passed, score $score/$total"
+
+      - name: Upload score
+        if: ${{ steps.score.outputs.score != '0' }}
+        run: |
+          summary=$(jq -n \
+            --arg channel "github" \
+            --argjson courseId "${{ secrets.QEMU_CAMP_2026_EXPER_RUST_AUTUMN_COURSE_ID }}" \
+            --arg ext "{}" \
+            --arg name "${{ github.actor }}" \
+            --argjson score "${{ steps.score.outputs.score }}" \
+            --argjson totalScore "${{ steps.score.outputs.total }}" \
+            '{channel: $channel, courseId: $courseId, ext: $ext, name: $name, score: $score, totalScore: $totalScore}')
+          echo "$summary"
+          curl -X POST "${{ secrets.QEMU_CAMP_2026_COURSE_POST_API }}" \
+            -H "accept: application/json;charset=utf-8" \
+            -H "Content-Type: application/json" \
+            -H "token: ${{ secrets.QEMU_CAMP_2026_EXPER_RUST_AUTUMN_TOKEN }}" \
+            -d "$summary" \
+            -v

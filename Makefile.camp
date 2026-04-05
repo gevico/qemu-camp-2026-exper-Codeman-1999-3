@@ -1,0 +1,200 @@
+# Makefile.camp - QEMU Camp 2026 Experiment Build System
+#
+# Usage: make -f Makefile.camp [target]
+#
+# All experiments are RISC-V based.
+#   - CPU experiment:  TCG testcase  (tests/gevico/tcg)    [softmmu]
+#   - SoC experiment:  QTest         (tests/gevico/qtest)  [softmmu]
+#   - GPGPU experiment: QTest        (tests/gevico/qtest)  [softmmu]
+#   - Rust experiment: QTest + unit  (tests/gevico/qtest)  [softmmu + rust]
+
+SHELL := bash -o pipefail
+MAKEFLAGS += -rR
+
+# Paths
+SRC_DIR   := $(realpath $(dir $(lastword $(MAKEFILE_LIST))))
+BUILD_DIR := $(SRC_DIR)/build
+
+# RISC-V cross compiler (for TCG testcases)
+CROSS_PREFIX ?= riscv64-unknown-elf-
+
+# Configure flags — one config to rule all experiments:
+#   riscv64-softmmu    : SoC/GPGPU QTest + CPU TCG system tests
+#   riscv64-linux-user : CPU TCG user-mode tests
+#   --enable-rust      : Rust experiment unit tests
+#   --cross-prefix     : bare-metal cross compiler for TCG testcases
+CONFIGURE_FLAGS := \
+    --target-list=riscv64-softmmu,riscv64-linux-user \
+    --extra-cflags='-O0 -g3' \
+    --cross-prefix-riscv64=$(CROSS_PREFIX) \
+    --enable-rust
+
+# Parallel jobs (default: nproc)
+NPROC := $(shell nproc 2>/dev/null || echo 4)
+JOBS  ?= $(NPROC)
+
+# Use QEMU's bundled meson from pyvenv to avoid version mismatch
+MESON = $(BUILD_DIR)/pyvenv/bin/meson
+
+# ─── Default target ──────────────────────────────────────────────────
+
+.PHONY: help
+help:
+	@echo "QEMU Camp 2026 - Experiment Build System"
+	@echo ""
+	@echo "Usage: make -f Makefile.camp <target>"
+	@echo ""
+	@echo "Build targets:"
+	@echo "  configure          Configure QEMU (riscv64-softmmu)"
+	@echo "  build              Build QEMU"
+	@echo "  rebuild            Clean and rebuild QEMU"
+	@echo ""
+	@echo "Test targets:"
+	@echo "  test               Run all experiment tests"
+	@echo "  test-cpu           Run CPU experiment tests (TCG testcase)"
+	@echo "  test-soc           Run SoC experiment tests (QTest)"
+	@echo "  test-gpgpu         Run GPGPU experiment tests (QTest)"
+	@echo "  test-rust          Run Rust experiment tests (QTest + unit)"
+	@echo "  test-rust-unit     Run Rust native unit tests only"
+	@echo "  test-rust-qtest    Run Rust QTest tests only"
+	@echo ""
+	@echo "Clean targets:"
+	@echo "  clean              Clean build artifacts"
+	@echo "  distclean          Remove build directory entirely"
+	@echo ""
+	@echo "Options:"
+	@echo "  JOBS=N             Parallel jobs (default: $(NPROC))"
+	@echo "  CROSS_PREFIX=...   RISC-V cross compiler prefix"
+	@echo "                     (default: riscv64-unknown-elf-)"
+	@echo "  V=1                Verbose output"
+
+# ─── Configure ────────────────────────────────────────────────────────
+
+.PHONY: configure
+configure:
+	@mkdir -p $(BUILD_DIR)
+	cd $(BUILD_DIR) && $(SRC_DIR)/configure $(CONFIGURE_FLAGS)
+	@echo "--- Configure done ---"
+
+$(BUILD_DIR)/config-host.mak:
+	$(MAKE) -f $(lastword $(MAKEFILE_LIST)) configure
+
+# ─── Build ────────────────────────────────────────────────────────────
+
+.PHONY: build
+build: $(BUILD_DIR)/config-host.mak
+	$(MAKE) -C $(BUILD_DIR) -j$(JOBS)
+	@echo "--- Build done ---"
+
+.PHONY: rebuild
+rebuild: clean build
+
+# ─── CPU experiment (TCG testcase) ────────────────────────────────────
+
+.PHONY: test-cpu
+test-cpu: build
+	$(MAKE) -C $(BUILD_DIR) check-gevico-tcg
+	@echo "--- CPU experiment tests done ---"
+
+# ─── SoC experiment (QTest) ───────────────────────────────────────────
+# 10 tests, each run as an independent meson test target
+
+SOC_TESTS := test-board-g233 test-gpio-basic test-gpio-int \
+             test-pwm-basic test-wdt-timeout test-spi-jedec \
+             test-flash-read test-flash-read-interrupt \
+             test-spi-cs test-spi-overrun
+
+.PHONY: test-soc
+test-soc: build
+	@passed=0; total=0; \
+	for t in $(SOC_TESTS); do \
+	    total=$$((total + 1)); \
+	    if cd $(BUILD_DIR) && $(MESON) test --no-rebuild --print-errorlogs \
+	        "qtest-riscv64/$$t" 2>/dev/null; then \
+	        passed=$$((passed + 1)); \
+	    fi; \
+	done; \
+	echo "$$passed" > $(BUILD_DIR)/soc-result.log; \
+	echo "--- SoC experiment: $$passed/$$total tests passed ---"
+
+# ─── GPGPU experiment (QTest via QOS) ─────────────────────────────────
+# 17 subtests inside qos-test, run individually for scoring.
+# Score: passed * 100 / 17 (rounded down), total = 100.
+
+GPGPU_SUBTESTS := device-id vram-size global-ctrl dispatch-regs \
+                  vram-access dma-regs irq-regs \
+                  simt-thread-id simt-block-id simt-warp-lane \
+                  simt-thread-mask simt-reset \
+                  kernel-exec fp-kernel-exec \
+                  lp-convert lp-convert-e5m2-e2m1 lp-convert-saturate
+
+GPGPU_TOTAL := 17
+
+.PHONY: test-gpgpu
+test-gpgpu: build
+	@passed=0; \
+	export QTEST_QEMU_BINARY=$(BUILD_DIR)/qemu-system-riscv64; \
+	for t in $(GPGPU_SUBTESTS); do \
+	    if $(BUILD_DIR)/tests/qtest/qos-test \
+	        -p /riscv64/virt/generic-pcihost/pci-bus-generic/pci-bus/gpgpu/gpgpu-tests/$$t \
+	        --tap -k 2>/dev/null | grep -q "^ok "; then \
+	        passed=$$((passed + 1)); \
+	    fi; \
+	done; \
+	score=$$((passed * 100 / $(GPGPU_TOTAL))); \
+	echo "$$passed" > $(BUILD_DIR)/gpgpu-result.log; \
+	echo "--- GPGPU experiment: $$passed/$(GPGPU_TOTAL) tests passed, score $$score/100 ---"
+
+# ─── Rust experiment (3 unit tests + 7 QTest = 10 tests, 100 pts) ─────
+
+RUST_QTEST_TESTS := test-i2c-gpio-init test-i2c-gpio-bitbang \
+                     test-i2c-eeprom-rw test-i2c-eeprom-page \
+                     test-spi-rust-init test-spi-rust-transfer \
+                     test-spi-rust-flash
+
+RUST_UNIT_NAMES := test_i2c_bus_create test_i2c_bus_read_write test_i2c_bus_nack
+
+.PHONY: test-rust
+test-rust: build
+	@passed=0; \
+	echo "=== Rust unit tests (I2C bus) ==="; \
+	for t in $(RUST_UNIT_NAMES); do \
+	    if cd $(BUILD_DIR) && $(MESON) test --no-rebuild \
+	        --test-args "$$t" rust-i2c-unit 2>/dev/null | grep -q "Ok:.*1"; then \
+	        passed=$$((passed + 1)); \
+	        echo "  PASS $$t"; \
+	    else \
+	        echo "  FAIL $$t"; \
+	    fi; \
+	done; \
+	echo "=== Rust QTest (I2C/SPI devices) ==="; \
+	for t in $(RUST_QTEST_TESTS); do \
+	    if cd $(BUILD_DIR) && $(MESON) test --no-rebuild --print-errorlogs \
+	        "qtest-riscv64/$$t" 2>/dev/null; then \
+	        passed=$$((passed + 1)); \
+	        echo "  PASS $$t"; \
+	    else \
+	        echo "  FAIL $$t"; \
+	    fi; \
+	done; \
+	echo "$$passed" > $(BUILD_DIR)/rust-result.log; \
+	score=$$((passed * 10)); \
+	echo "--- Rust experiment: $$passed/10 tests passed, score $$score/100 ---"
+
+# ─── Run all tests ────────────────────────────────────────────────────
+
+.PHONY: test
+test: test-cpu test-soc test-gpgpu test-rust
+	@echo "=== All experiment tests done ==="
+
+# ─── Clean ────────────────────────────────────────────────────────────
+
+.PHONY: clean
+clean:
+	@if [ -d $(BUILD_DIR) ] && [ -f $(BUILD_DIR)/build.ninja ]; then \
+	    $(MAKE) -C $(BUILD_DIR) clean; \
+	fi
+
+.PHONY: distclean
+distclean:
+	rm -rf $(BUILD_DIR) $(SRC_DIR)/GNUmakefile
