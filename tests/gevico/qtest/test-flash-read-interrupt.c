@@ -76,8 +76,10 @@ static void flash_wait_busy(QTestState *qts)
     int timeout = 10000;
     uint8_t sr;
     do {
+        qtest_writel(qts, SPI_CR2, 0);
         spi_xfer(qts, FLASH_CMD_READ_STATUS);
         sr = spi_xfer(qts, 0x00);
+        qtest_writel(qts, SPI_CR2, 1);
         qtest_clock_step(qts, 100000);
     } while ((sr & FLASH_SR_BUSY) && --timeout);
     g_assert_cmpint(timeout, >, 0);
@@ -157,14 +159,20 @@ static void test_flash_write_test_data(void)
 
     /* Write enable + sector erase */
     spi_xfer(qts, FLASH_CMD_WRITE_ENABLE);
+    qtest_writel(qts, SPI_CR2, 1);
+    qtest_writel(qts, SPI_CR2, 0);
     spi_xfer(qts, FLASH_CMD_SECTOR_ERASE);
     spi_xfer(qts, 0x00);
     spi_xfer(qts, 0x00);
     spi_xfer(qts, 0x00);
+    qtest_writel(qts, SPI_CR2, 1);
     flash_wait_busy(qts);
 
     /* Write enable + page program */
+    qtest_writel(qts, SPI_CR2, 0);
     spi_xfer(qts, FLASH_CMD_WRITE_ENABLE);
+    qtest_writel(qts, SPI_CR2, 1);
+    qtest_writel(qts, SPI_CR2, 0);
     spi_xfer(qts, FLASH_CMD_PAGE_PROGRAM);
     spi_xfer(qts, 0x00);
     spi_xfer(qts, 0x00);
@@ -172,9 +180,11 @@ static void test_flash_write_test_data(void)
     for (int i = 0; i < 64; i++) {
         spi_xfer(qts, wbuf[i]);
     }
+    qtest_writel(qts, SPI_CR2, 1);
     flash_wait_busy(qts);
 
     /* Read data */
+    qtest_writel(qts, SPI_CR2, 0);
     spi_xfer(qts, FLASH_CMD_READ_DATA);
     spi_xfer(qts, 0x00);
     spi_xfer(qts, 0x00);
@@ -182,7 +192,7 @@ static void test_flash_write_test_data(void)
     for (int i = 0; i < 64; i++) {
         rbuf[i] = spi_xfer(qts, 0x00);
     }
-
+    qtest_writel(qts, SPI_CR2, 1);
     g_assert_cmpmem(wbuf, 64, rbuf, 64);
 
     qtest_quit(qts);

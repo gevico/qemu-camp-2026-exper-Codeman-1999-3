@@ -65,13 +65,15 @@ static void spi_select(QTestState *qts, int cs)
     qtest_writel(qts, SPI_CR2, cs & 0x3);
 }
 
-static void flash_wait_busy(QTestState *qts)
+static void flash_wait_busy(QTestState *qts, int cs)
 {
     int timeout = 10000;
     uint8_t sr;
     do {
+        spi_select(qts, cs);
         spi_xfer(qts, FLASH_CMD_READ_STATUS);
         sr = spi_xfer(qts, 0x00);
+        spi_select(qts, cs ^ 1);
         qtest_clock_step(qts, 100000);
     } while ((sr & FLASH_SR_BUSY) && --timeout);
 }
@@ -87,18 +89,25 @@ static uint32_t flash_read_jedec(QTestState *qts)
 
 static void flash_erase_program_read(QTestState *qts, uint32_t addr,
                                      const uint8_t *wbuf, uint8_t *rbuf,
-                                     int len)
+                                     int len, int cs)
 {
     /* Erase */
+    spi_select(qts, cs);
     spi_xfer(qts, FLASH_CMD_WRITE_ENABLE);
+    spi_select(qts, cs ^ 1);
+    spi_select(qts, cs);
     spi_xfer(qts, FLASH_CMD_SECTOR_ERASE);
     spi_xfer(qts, (addr >> 16) & 0xFF);
     spi_xfer(qts, (addr >> 8) & 0xFF);
     spi_xfer(qts, addr & 0xFF);
-    flash_wait_busy(qts);
+    spi_select(qts, cs ^ 1);
+    flash_wait_busy(qts, cs);
 
     /* Program */
+    spi_select(qts, cs);
     spi_xfer(qts, FLASH_CMD_WRITE_ENABLE);
+    spi_select(qts, cs ^ 1);
+    spi_select(qts, cs);
     spi_xfer(qts, FLASH_CMD_PAGE_PROGRAM);
     spi_xfer(qts, (addr >> 16) & 0xFF);
     spi_xfer(qts, (addr >> 8) & 0xFF);
@@ -106,9 +115,11 @@ static void flash_erase_program_read(QTestState *qts, uint32_t addr,
     for (int i = 0; i < len; i++) {
         spi_xfer(qts, wbuf[i]);
     }
-    flash_wait_busy(qts);
+    spi_select(qts, cs ^ 1);
+    flash_wait_busy(qts, cs);
 
     /* Read */
+    spi_select(qts, cs);
     spi_xfer(qts, FLASH_CMD_READ_DATA);
     spi_xfer(qts, (addr >> 16) & 0xFF);
     spi_xfer(qts, (addr >> 8) & 0xFF);
@@ -116,6 +127,7 @@ static void flash_erase_program_read(QTestState *qts, uint32_t addr,
     for (int i = 0; i < len; i++) {
         rbuf[i] = spi_xfer(qts, 0x00);
     }
+    spi_select(qts, cs ^ 1);
 }
 
 /* Identify both Flash chips */
@@ -143,13 +155,13 @@ static void test_individual_flash_operations(void)
     /* CS0: write pattern 0xAA */
     for (int i = 0; i < 16; i++) wbuf[i] = 0xAA;
     spi_select(qts, 0);
-    flash_erase_program_read(qts, 0x000000, wbuf, rbuf, 16);
+    flash_erase_program_read(qts, 0x000000, wbuf, rbuf, 16, 0);
     g_assert_cmpmem(wbuf, 16, rbuf, 16);
 
     /* CS1: write pattern 0x55 */
     for (int i = 0; i < 16; i++) wbuf[i] = 0x55;
     spi_select(qts, 1);
-    flash_erase_program_read(qts, 0x000000, wbuf, rbuf, 16);
+    flash_erase_program_read(qts, 0x000000, wbuf, rbuf, 16, 1);
     g_assert_cmpmem(wbuf, 16, rbuf, 16);
 
     qtest_quit(qts);
@@ -169,9 +181,9 @@ static void test_cross_flash_operations(void)
 
     /* Write to both at same address */
     spi_select(qts, 0);
-    flash_erase_program_read(qts, 0x002000, w0, r0, 16);
+    flash_erase_program_read(qts, 0x002000, w0, r0, 16, 0);
     spi_select(qts, 1);
-    flash_erase_program_read(qts, 0x002000, w1, r1, 16);
+    flash_erase_program_read(qts, 0x002000, w1, r1, 16, 1);
 
     /* Re-read CS0 to make sure it wasn't corrupted */
     spi_select(qts, 0);
@@ -197,10 +209,10 @@ static void test_alternating_operations(void)
     qtest_writel(qts, SPI_CR1, SPI_CR1_SPE | SPI_CR1_MSTR);
 
     spi_select(qts, 0);
-    flash_erase_program_read(qts, 0x003000, w0, r, 4);
+    flash_erase_program_read(qts, 0x003000, w0, r, 4, 0);
 
     spi_select(qts, 1);
-    flash_erase_program_read(qts, 0x003000, w1, r, 4);
+    flash_erase_program_read(qts, 0x003000, w1, r, 4, 1);
 
     /* Alternate reads */
     for (int round = 0; round < 3; round++) {
@@ -231,13 +243,13 @@ static void test_flash_capacity(void)
     /* CS0: write near 2MB boundary */
     uint32_t cs0_addr = CS0_SIZE - 4096;
     spi_select(qts, 0);
-    flash_erase_program_read(qts, cs0_addr, wbuf, rbuf, 4);
+    flash_erase_program_read(qts, cs0_addr, wbuf, rbuf, 4, 0);
     g_assert_cmpmem(wbuf, 4, rbuf, 4);
 
     /* CS1: write near 4MB boundary */
     uint32_t cs1_addr = CS1_SIZE - 4096;
     spi_select(qts, 1);
-    flash_erase_program_read(qts, cs1_addr, wbuf, rbuf, 4);
+    flash_erase_program_read(qts, cs1_addr, wbuf, rbuf, 4, 1);
     g_assert_cmpmem(wbuf, 4, rbuf, 4);
 
     qtest_quit(qts);

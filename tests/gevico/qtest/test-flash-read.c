@@ -68,8 +68,11 @@ static void spi_init(QTestState *qts)
 
 static uint8_t flash_read_status(QTestState *qts)
 {
+    qtest_writel(qts, SPI_CR2, 0);
     spi_xfer(qts, FLASH_CMD_READ_STATUS);
-    return spi_xfer(qts, 0x00);
+    uint8_t sr = spi_xfer(qts, 0x00);
+    qtest_writel(qts, SPI_CR2, 1);
+    return sr;
 }
 
 static void flash_wait_busy(QTestState *qts)
@@ -83,16 +86,20 @@ static void flash_wait_busy(QTestState *qts)
 
 static void flash_write_enable(QTestState *qts)
 {
+    qtest_writel(qts, SPI_CR2, 0);
     spi_xfer(qts, FLASH_CMD_WRITE_ENABLE);
+    qtest_writel(qts, SPI_CR2, 1);
 }
 
 static void flash_sector_erase(QTestState *qts, uint32_t addr)
 {
     flash_write_enable(qts);
+    qtest_writel(qts, SPI_CR2, 0);
     spi_xfer(qts, FLASH_CMD_SECTOR_ERASE);
     spi_xfer(qts, (addr >> 16) & 0xFF);
     spi_xfer(qts, (addr >> 8) & 0xFF);
     spi_xfer(qts, addr & 0xFF);
+    qtest_writel(qts, SPI_CR2, 1);
     flash_wait_busy(qts);
 }
 
@@ -100,6 +107,7 @@ static void flash_page_program(QTestState *qts, uint32_t addr,
                                const uint8_t *data, int len)
 {
     flash_write_enable(qts);
+    qtest_writel(qts, SPI_CR2, 0);
     spi_xfer(qts, FLASH_CMD_PAGE_PROGRAM);
     spi_xfer(qts, (addr >> 16) & 0xFF);
     spi_xfer(qts, (addr >> 8) & 0xFF);
@@ -108,12 +116,14 @@ static void flash_page_program(QTestState *qts, uint32_t addr,
     for (int i = 0; i < len; i++) {
         spi_xfer(qts, data[i]);
     }
+    qtest_writel(qts, SPI_CR2, 1);
     flash_wait_busy(qts);
 }
 
 static void flash_read_data(QTestState *qts, uint32_t addr,
                             uint8_t *buf, int len)
 {
+    qtest_writel(qts, SPI_CR2, 0);
     spi_xfer(qts, FLASH_CMD_READ_DATA);
     spi_xfer(qts, (addr >> 16) & 0xFF);
     spi_xfer(qts, (addr >> 8) & 0xFF);
@@ -122,6 +132,7 @@ static void flash_read_data(QTestState *qts, uint32_t addr,
     for (int i = 0; i < len; i++) {
         buf[i] = spi_xfer(qts, 0x00);
     }
+    qtest_writel(qts, SPI_CR2, 1);
 }
 
 /* Test: read status register */
