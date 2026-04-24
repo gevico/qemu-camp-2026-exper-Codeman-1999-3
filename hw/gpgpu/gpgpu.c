@@ -18,27 +18,262 @@
 #include "hw/pci/msix.h"
 #include "hw/core/qdev-properties.h"
 #include "migration/vmstate.h"
+#include "exec/cpu-common.h"
 
 #include "gpgpu.h"
 #include "gpgpu_core.h"
 
-/* TODO: Implement MMIO control register read */
 static uint64_t gpgpu_ctrl_read(void *opaque, hwaddr addr, unsigned size)
 {
-    (void)opaque;
-    (void)addr;
+    GPGPUState *s = GPGPU(opaque);
     (void)size;
-    return 0;
+
+    switch (addr) {
+    /* 设备信息寄存器 */
+    case GPGPU_REG_DEV_ID:
+        return GPGPU_DEV_ID_VALUE;
+    case GPGPU_REG_DEV_VERSION:
+        return GPGPU_DEV_VERSION_VALUE;
+    case GPGPU_REG_DEV_CAPS:
+        return s->num_cus | (s->warps_per_cu << 8) | (s->warp_size << 16);
+    case GPGPU_REG_VRAM_SIZE_LO:
+        return (uint32_t)s->vram_size;
+    case GPGPU_REG_VRAM_SIZE_HI:
+        return (uint32_t)(s->vram_size >> 32);
+
+    /* 全局控制寄存器 */
+    case GPGPU_REG_GLOBAL_CTRL:
+        return s->global_ctrl;
+    case GPGPU_REG_GLOBAL_STATUS:
+        return s->global_status;
+    case GPGPU_REG_ERROR_STATUS:
+        return s->error_status;
+
+    /* 中断寄存器 */
+    case GPGPU_REG_IRQ_ENABLE:
+        return s->irq_enable;
+    case GPGPU_REG_IRQ_STATUS:
+        return s->irq_status;
+
+    /* 内核分发寄存器 */
+    case GPGPU_REG_KERNEL_ADDR_LO:
+        return (uint32_t)s->kernel.kernel_addr;
+    case GPGPU_REG_KERNEL_ADDR_HI:
+        return (uint32_t)(s->kernel.kernel_addr >> 32);
+    case GPGPU_REG_KERNEL_ARGS_LO:
+        return (uint32_t)s->kernel.kernel_args;
+    case GPGPU_REG_KERNEL_ARGS_HI:
+        return (uint32_t)(s->kernel.kernel_args >> 32);
+    case GPGPU_REG_GRID_DIM_X:
+        return s->kernel.grid_dim[0];
+    case GPGPU_REG_GRID_DIM_Y:
+        return s->kernel.grid_dim[1];
+    case GPGPU_REG_GRID_DIM_Z:
+        return s->kernel.grid_dim[2];
+    case GPGPU_REG_BLOCK_DIM_X:
+        return s->kernel.block_dim[0];
+    case GPGPU_REG_BLOCK_DIM_Y:
+        return s->kernel.block_dim[1];
+    case GPGPU_REG_BLOCK_DIM_Z:
+        return s->kernel.block_dim[2];
+    case GPGPU_REG_SHARED_MEM_SIZE:
+        return s->kernel.shared_mem_size;
+
+    /* DMA 寄存器 */
+    case GPGPU_REG_DMA_SRC_LO:
+        return (uint32_t)s->dma.src_addr;
+    case GPGPU_REG_DMA_SRC_HI:
+        return (uint32_t)(s->dma.src_addr >> 32);
+    case GPGPU_REG_DMA_DST_LO:
+        return (uint32_t)s->dma.dst_addr;
+    case GPGPU_REG_DMA_DST_HI:
+        return (uint32_t)(s->dma.dst_addr >> 32);
+    case GPGPU_REG_DMA_SIZE:
+        return s->dma.size;
+    case GPGPU_REG_DMA_CTRL:
+        return s->dma.ctrl;
+    case GPGPU_REG_DMA_STATUS:
+        return s->dma.status;
+
+    /* SIMT 上下文寄存器 */
+    case GPGPU_REG_THREAD_ID_X:
+        return s->simt.thread_id[0];
+    case GPGPU_REG_THREAD_ID_Y:
+        return s->simt.thread_id[1];
+    case GPGPU_REG_THREAD_ID_Z:
+        return s->simt.thread_id[2];
+    case GPGPU_REG_BLOCK_ID_X:
+        return s->simt.block_id[0];
+    case GPGPU_REG_BLOCK_ID_Y:
+        return s->simt.block_id[1];
+    case GPGPU_REG_BLOCK_ID_Z:
+        return s->simt.block_id[2];
+    case GPGPU_REG_WARP_ID:
+        return s->simt.warp_id;
+    case GPGPU_REG_LANE_ID:
+        return s->simt.lane_id;
+
+    /* 同步寄存器 */
+    case GPGPU_REG_THREAD_MASK:
+        return s->simt.thread_mask;
+
+    default:
+        return 0;
+    }
 }
 
-/* TODO: Implement MMIO control register write */
 static void gpgpu_ctrl_write(void *opaque, hwaddr addr, uint64_t val,
                              unsigned size)
 {
-    (void)opaque;
-    (void)addr;
-    (void)val;
+    GPGPUState *s = GPGPU(opaque);
     (void)size;
+
+    switch (addr) {
+    /* 只读寄存器: 忽略写入 */
+    case GPGPU_REG_DEV_ID:
+    case GPGPU_REG_DEV_VERSION:
+    case GPGPU_REG_DEV_CAPS:
+    case GPGPU_REG_VRAM_SIZE_LO:
+    case GPGPU_REG_VRAM_SIZE_HI:
+    case GPGPU_REG_GLOBAL_STATUS:
+    case GPGPU_REG_IRQ_STATUS:
+    case GPGPU_REG_DMA_STATUS:
+        break;
+
+    /* 全局控制寄存器 */
+    case GPGPU_REG_GLOBAL_CTRL:
+        s->global_ctrl = (uint32_t)val;
+        if (val & GPGPU_CTRL_RESET) {
+            /* 软复位: 清零 global_ctrl/error/irq/simt/kernel/dma, VRAM 不清零 */
+            s->global_ctrl = 0;
+            s->global_status = GPGPU_STATUS_READY;
+            s->error_status = 0;
+            s->irq_enable = 0;
+            s->irq_status = 0;
+            memset(&s->kernel, 0, sizeof(s->kernel));
+            memset(&s->dma, 0, sizeof(s->dma));
+            memset(&s->simt, 0, sizeof(s->simt));
+            timer_del(s->dma_timer);
+            timer_del(s->kernel_timer);
+        }
+        break;
+    case GPGPU_REG_ERROR_STATUS:
+        /* W1C: 写1清除对应位 */
+        s->error_status &= ~((uint32_t)val);
+        break;
+
+    /* 中断寄存器 */
+    case GPGPU_REG_IRQ_ENABLE:
+        s->irq_enable = (uint32_t)val;
+        break;
+    case GPGPU_REG_IRQ_ACK:
+        /* 写1清除对应中断状态位 */
+        s->irq_status &= ~((uint32_t)val);
+        break;
+
+    /* 内核分发寄存器 */
+    case GPGPU_REG_KERNEL_ADDR_LO:
+        s->kernel.kernel_addr = (s->kernel.kernel_addr & ~0xFFFFFFFFULL) | (uint32_t)val;
+        break;
+    case GPGPU_REG_KERNEL_ADDR_HI:
+        s->kernel.kernel_addr = (s->kernel.kernel_addr & 0xFFFFFFFFULL) | ((uint64_t)(uint32_t)val << 32);
+        break;
+    case GPGPU_REG_KERNEL_ARGS_LO:
+        s->kernel.kernel_args = (s->kernel.kernel_args & ~0xFFFFFFFFULL) | (uint32_t)val;
+        break;
+    case GPGPU_REG_KERNEL_ARGS_HI:
+        s->kernel.kernel_args = (s->kernel.kernel_args & 0xFFFFFFFFULL) | ((uint64_t)(uint32_t)val << 32);
+        break;
+    case GPGPU_REG_GRID_DIM_X:
+        s->kernel.grid_dim[0] = (uint32_t)val;
+        break;
+    case GPGPU_REG_GRID_DIM_Y:
+        s->kernel.grid_dim[1] = (uint32_t)val;
+        break;
+    case GPGPU_REG_GRID_DIM_Z:
+        s->kernel.grid_dim[2] = (uint32_t)val;
+        break;
+    case GPGPU_REG_BLOCK_DIM_X:
+        s->kernel.block_dim[0] = (uint32_t)val;
+        break;
+    case GPGPU_REG_BLOCK_DIM_Y:
+        s->kernel.block_dim[1] = (uint32_t)val;
+        break;
+    case GPGPU_REG_BLOCK_DIM_Z:
+        s->kernel.block_dim[2] = (uint32_t)val;
+        break;
+    case GPGPU_REG_SHARED_MEM_SIZE:
+        s->kernel.shared_mem_size = (uint32_t)val;
+        break;
+    case GPGPU_REG_DISPATCH:
+        /* 写任意值触发内核执行 */
+        gpgpu_core_exec_kernel(s);
+        break;
+
+    /* DMA 寄存器 */
+    case GPGPU_REG_DMA_SRC_LO:
+        s->dma.src_addr = (s->dma.src_addr & ~0xFFFFFFFFULL) | (uint32_t)val;
+        break;
+    case GPGPU_REG_DMA_SRC_HI:
+        s->dma.src_addr = (s->dma.src_addr & 0xFFFFFFFFULL) | ((uint64_t)(uint32_t)val << 32);
+        break;
+    case GPGPU_REG_DMA_DST_LO:
+        s->dma.dst_addr = (s->dma.dst_addr & ~0xFFFFFFFFULL) | (uint32_t)val;
+        break;
+    case GPGPU_REG_DMA_DST_HI:
+        s->dma.dst_addr = (s->dma.dst_addr & 0xFFFFFFFFULL) | ((uint64_t)(uint32_t)val << 32);
+        break;
+    case GPGPU_REG_DMA_SIZE:
+        s->dma.size = (uint32_t)val;
+        break;
+    case GPGPU_REG_DMA_CTRL:
+        s->dma.ctrl = (uint32_t)val;
+        if (val & GPGPU_DMA_START) {
+            /* 启动 DMA 传输, 设置 1ms 延迟定时器 */
+            s->dma.status = GPGPU_DMA_BUSY;
+            s->dma.ctrl &= ~GPGPU_DMA_START;  /* START 位自动清除 */
+            timer_mod(s->dma_timer,
+                      qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 1);
+        }
+        break;
+
+    /* SIMT 上下文寄存器 */
+    case GPGPU_REG_THREAD_ID_X:
+        s->simt.thread_id[0] = (uint32_t)val;
+        break;
+    case GPGPU_REG_THREAD_ID_Y:
+        s->simt.thread_id[1] = (uint32_t)val;
+        break;
+    case GPGPU_REG_THREAD_ID_Z:
+        s->simt.thread_id[2] = (uint32_t)val;
+        break;
+    case GPGPU_REG_BLOCK_ID_X:
+        s->simt.block_id[0] = (uint32_t)val;
+        break;
+    case GPGPU_REG_BLOCK_ID_Y:
+        s->simt.block_id[1] = (uint32_t)val;
+        break;
+    case GPGPU_REG_BLOCK_ID_Z:
+        s->simt.block_id[2] = (uint32_t)val;
+        break;
+    case GPGPU_REG_WARP_ID:
+        s->simt.warp_id = (uint32_t)val;
+        break;
+    case GPGPU_REG_LANE_ID:
+        s->simt.lane_id = (uint32_t)val;
+        break;
+
+    /* 同步寄存器 */
+    case GPGPU_REG_BARRIER:
+        /* 写任意值触发 barrier */
+        break;
+    case GPGPU_REG_THREAD_MASK:
+        s->simt.thread_mask = (uint32_t)val;
+        break;
+
+    default:
+        break;
+    }
 }
 
 static const MemoryRegionOps gpgpu_ctrl_ops = {
@@ -54,20 +289,32 @@ static const MemoryRegionOps gpgpu_ctrl_ops = {
 /* TODO: Implement VRAM read */
 static uint64_t gpgpu_vram_read(void *opaque, hwaddr addr, unsigned size)
 {
-    (void)opaque;
-    (void)addr;
-    (void)size;
-    return 0;
+    GPGPUState *s = GPGPU(opaque);
+
+    if (addr + size > s->vram_size) {
+        return 0;
+    }
+
+    uint64_t val = 0;
+    for (unsigned i = 0; i < size; i++) {
+        val |= ((uint64_t)s->vram_ptr[addr + i]) << (i * 8);
+    }
+    return val;
 }
 
 /* TODO: Implement VRAM write */
 static void gpgpu_vram_write(void *opaque, hwaddr addr, uint64_t val,
                              unsigned size)
 {
-    (void)opaque;
-    (void)addr;
-    (void)val;
-    (void)size;
+    GPGPUState *s = GPGPU(opaque);
+
+    if (addr + size > s->vram_size) {
+        return;
+    }
+
+    for (unsigned i = 0; i < size; i++) {
+        s->vram_ptr[addr + i] = (uint8_t)(val >> (i * 8));
+    }
 }
 
 static const MemoryRegionOps gpgpu_vram_ops = {
@@ -107,16 +354,46 @@ static const MemoryRegionOps gpgpu_doorbell_ops = {
     },
 };
 
-/* TODO: Implement DMA completion handler */
 static void gpgpu_dma_complete(void *opaque)
 {
-    (void)opaque;
+    GPGPUState *s = GPGPU(opaque);
+    bool dir_from_vram = (s->dma.ctrl & GPGPU_DMA_DIR_FROM_VRAM);
+
+    if (dir_from_vram) {
+        /* VRAM → Host */
+        if (s->dma.src_addr + s->dma.size <= s->vram_size) {
+            cpu_physical_memory_write(s->dma.dst_addr,
+                                      s->vram_ptr + s->dma.src_addr,
+                                      s->dma.size);
+        }
+    } else {
+        /* Host → VRAM */
+        if (s->dma.dst_addr + s->dma.size <= s->vram_size) {
+            cpu_physical_memory_read(s->dma.src_addr,
+                                     s->vram_ptr + s->dma.dst_addr,
+                                     s->dma.size);
+        }
+    }
+
+    s->dma.status = GPGPU_DMA_COMPLETE;
+    /* DMA_CTRL.IRQ_EN=1 时触发中断 */
+    if (s->dma.ctrl & GPGPU_DMA_IRQ_ENABLE) {
+        s->irq_status |= GPGPU_IRQ_DMA_DONE;
+        msix_notify(PCI_DEVICE(s), GPGPU_MSIX_VEC_DMA);
+    }
 }
 
-/* TODO: Implement kernel completion handler */
 static void gpgpu_kernel_complete(void *opaque)
 {
-    (void)opaque;
+    GPGPUState *s = GPGPU(opaque);
+
+    s->global_status &= ~GPGPU_STATUS_BUSY;
+    s->global_status |= GPGPU_STATUS_READY;
+    s->irq_status |= GPGPU_IRQ_KERNEL_DONE;
+
+    if (s->irq_enable & GPGPU_IRQ_KERNEL_DONE) {
+        msix_notify(PCI_DEVICE(s), GPGPU_MSIX_VEC_KERNEL);
+    }
 }
 
 static void gpgpu_realize(PCIDevice *pdev, Error **errp)

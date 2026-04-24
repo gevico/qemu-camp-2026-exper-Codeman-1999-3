@@ -1,0 +1,252 @@
+---
+description: 
+alwaysApply: true
+enabled: true
+updatedAt: 2026-04-24T06:55:01.536Z
+provider: 
+---
+
+# GPGPU 虚拟加速器设备建模技能
+
+## 实验目标
+
+在 QEMU 中实现一个虚拟 PCIe 3D 加速器设备（GPGPU），通过 17 道 QTest 测题验证，满分 100 分。设备需支持：
+- PCI 设备注册与 BAR 映射
+- MMIO 控制寄存器读写
+- VRAM 访问与 DMA 引擎
+- SIMT 执行模型（Warp 锁步、Grid/Block/Thread 层次）
+- RV32I 整数指令解释器
+- RV32F 单精度浮点指令
+- 低精度浮点扩展（BF16/FP8-E4M3/FP8-E5M2/FP4-E2M1）
+
+## 依赖环境
+
+- Docker 容器（`docker build -t qemu-camp .` + `docker run -it --rm -v $(pwd):/src qemu-camp bash`）
+- 容器内：`make -f Makefile.camp configure` → `make -f Makefile.camp build`
+- 测试：`make -f Makefile.camp test-gpgpu`（或单测 `build/tests/qtest/qos-test -p /riscv64/virt/generic-pcihost/pci-bus-generic/pci-bus/gpgpu/gpgpu-tests/<subtest>`）
+
+## 关键源文件
+
+| 文件 | 职责 |
+|------|------|
+| `hw/gpgpu/gpgpu.h` | 主头文件：寄存器偏移/位域定义、`GPGPUState`/`GPGPUKernelParams`/`GPGPUDMAState`/`GPGPUSIMTContext` 结构体 |
+| `hw/gpgpu/gpgpu.c` | PCI 设备框架：realize/exit/reset、BAR 注册、MMIO ops、DMA/kernel 完成回调 |
+| `hw/gpgpu/gpgpu_core.h` | SIMT 核心头文件：`GPGPULane`/`GPGPUWarp` 结构体、CTRL 地址定义、mhartid 编码宏 |
+| `hw/gpgpu/gpgpu_core.c` | SIMT 执行引擎：warp 初始化、RV32I/RV32F 指令解释器、kernel 调度 |
+| `tests/qtest/gpgpu-test.c` | 17 道 QTest 测题源码（只读参考，不修改） |
+
+## PCI 配置
+
+| 项目 | 值 |
+|------|-----|
+| Vendor ID | `0x1234` |
+| Device ID | `0x1337` |
+| Revision | `0x01` |
+| Class Code | `0x0302` (PCI_CLASS_DISPLAY_3D) |
+| MSI-X | 4 向量（kernel_done=0, dma_done=1, error=2） |
+
+## BAR 映射
+
+| BAR | 大小 | 类型 | 用途 |
+|-----|------|------|------|
+| BAR0 | 1 MiB | 64-bit MMIO | 控制/状态寄存器 |
+| BAR2 | 64 MiB | 64-bit MMIO, 可预取 | VRAM（代码+数据） |
+| BAR4 | 64 KiB | 32-bit MMIO | Doorbell（未实现） |
+
+## BAR0 寄存器偏移速查
+
+| 区域 | Offset | 寄存器 | 复位值 | 访问 |
+|------|--------|--------|--------|------|
+| 设备信息 | 0x0000 | DEV_ID | 0x47505055 | R |
+| | 0x0004 | DEV_VERSION | 0x00010000 | R |
+| | 0x0008 | DEV_CAPS | (num_cus\|warps_per_cu<<8\|warp_size<<16) | R |
+| | 0x000C | VRAM_SIZE_LO | 0x04000000 | R |
+| | 0x0010 | VRAM_SIZE_HI | 0x00000000 | R |
+| 全局控制 | 0x0100 | GLOBAL_CTRL | 0 | R/W (bit0=ENABLE, bit1=RESET) |
+| | 0x0104 | GLOBAL_STATUS | 0x1 | R (bit0=READY, bit1=BUSY, bit2=ERROR) |
+| | 0x0108 | ERROR_STATUS | 0 | R/W1C |
+| 中断 | 0x0200 | IRQ_ENABLE | 0 | R/W |
+| | 0x0204 | IRQ_STATUS | 0 | R |
+| | 0x0208 | IRQ_ACK | - | W (写1清除) |
+| 内核分发 | 0x0300 | KERNEL_ADDR_LO | 0 | R/W |
+| | 0x0304 | KERNEL_ADDR_HI | 0 | R/W |
+| | 0x0308 | KERNEL_ARGS_LO | 0 | R/W |
+| | 0x030C | KERNEL_ARGS_HI | 0 | R/W |
+| | 0x0310 | GRID_DIM_X | 0 | R/W |
+| | 0x0314 | GRID_DIM_Y | 0 | R/W |
+| | 0x0318 | GRID_DIM_Z | 0 | R/W |
+| | 0x031C | BLOCK_DIM_X | 0 | R/W |
+| | 0x0320 | BLOCK_DIM_Y | 0 | R/W |
+| | 0x0324 | BLOCK_DIM_Z | 0 | R/W |
+| | 0x0328 | SHARED_MEM_SIZE | 0 | R/W |
+| | 0x0330 | DISPATCH | - | W (写任意值触发) |
+| DMA | 0x0400 | DMA_SRC_LO | 0 | R/W |
+| | 0x0404 | DMA_SRC_HI | 0 | R/W |
+| | 0x0408 | DMA_DST_LO | 0 | R/W |
+| | 0x040C | DMA_DST_HI | 0 | R/W |
+| | 0x0410 | DMA_SIZE | 0 | R/W |
+| | 0x0414 | DMA_CTRL | 0 | R/W (bit0=START, bit1=DIR, bit2=IRQ_EN) |
+| | 0x0418 | DMA_STATUS | 0 | R (bit0=BUSY, bit1=COMPLETE, bit2=ERROR) |
+| SIMT | 0x1000 | THREAD_ID_X/Y/Z | 0 | R/W |
+| | 0x1010 | BLOCK_ID_X/Y/Z | 0 | R/W |
+| | 0x1020 | WARP_ID | 0 | R/W |
+| | 0x1024 | LANE_ID | 0 | R/W |
+| 同步 | 0x2000 | BARRIER | - | W |
+| | 0x2004 | THREAD_MASK | 0 | R/W |
+
+## 需实现的 6 个函数（按依赖顺序）
+
+### 1. `gpgpu_vram_read` / `gpgpu_vram_write`（gpgpu.c）
+- 读写 `s->vram_ptr`，边界检查 `addr + size <= s->vram_size`
+- 支持 1-8 字节访问，小端序
+- 对应测试：test-vram-access（实验五）
+
+### 2. `gpgpu_ctrl_read` / `gpgpu_ctrl_write`（gpgpu.c）
+- 根据 addr 偏移 switch-case 读写对应状态字段
+- 只读寄存器（DEV_ID/VERSION/CAPS/VRAM_SIZE/GLOBAL_STATUS/IRQ_STATUS/DMA_STATUS）写时忽略
+- DISPATCH（0x0330）写入时触发 `gpgpu_core_exec_kernel(s)`
+- DMA_CTRL（0x0414）写入 START=1 时启动 DMA（设置 dma_timer 1ms 延迟）
+- GLOBAL_CTRL.RESET=1 写入时触发软复位（清零 global_ctrl/error/irq/simt/kernel/dma，恢复 STATUS=READY，VRAM 不清零）
+- 对应测试：实验一~四、六~七
+
+### 3. `gpgpu_dma_complete`（gpgpu.c）
+- 根据 DMA 方向执行 `cpu_physical_memory_rw` 或 `memcpy(vram_ptr)`
+- 设置 DMA_STATUS.COMPLETE，清除 BUSY
+- 若 DMA_CTRL.IRQ_EN=1，设置 IRQ_STATUS.DMA_DONE，触发 MSI-X 向量 1
+
+### 4. `gpgpu_kernel_complete`（gpgpu.c）
+- 清除 GLOBAL_STATUS.BUSY，恢复 READY
+- 设置 IRQ_STATUS.KERNEL_DONE
+- 若 IRQ_ENABLE 对应位有效，触发 MSI-X 向量 0
+
+### 5. `gpgpu_core_init_warp`（gpgpu_core.c）
+- 初始化每个 lane：PC=kernel_addr, mhartid=MHARTID_ENCODE(block_id_linear, warp_id, lane), gpr[0]=0, active=(lane < num_threads), fp_status 初始化
+- 设置 warp->active_mask = (1 << num_threads) - 1
+- 设置 warp->warp_id, warp->block_id[], warp->thread_id_base
+
+### 6. `gpgpu_core_exec_warp`（gpgpu_core.c）— 最核心
+- 循环执行直到 active_mask==0 或 max_cycles 耗尽
+- 每周期：取指 `ldl_code(s->vram_ptr + lane->pc)`，解码执行一条 RV32I/RV32F 指令
+- 所有活跃 lane 共享 PC（SIMT 锁步），但各自寄存器独立
+- Lane 遇到 `ebreak` 或 `ret`(jalr x0, ra, 0 且 ra==0) 时 active=false，对应 active_mask 位清零
+- 内存访问：`0x00000000~VRAM_SIZE-1` 读写 VRAM，`0x80000000+offset` 只读 CTRL 寄存器
+- 超过 100000 周期返回 -1 (KERNEL_FAULT)
+
+### 7. `gpgpu_core_exec_kernel`（gpgpu_core.c）
+- 遍历 grid_dim[0]*grid_dim[1]*grid_dim[2] 个 Block
+- 每个 Block 按 warp_size=32 分成多个 Warp
+- 对每个 Warp 调用 `gpgpu_core_init_warp` + `gpgpu_core_exec_warp`
+- 更新 `s->simt` 上下文寄存器以反映当前执行位置
+- 全部完成后调用 `gpgpu_kernel_complete` 定时器回调（或直接同步调用）
+
+## 指令集实现要求
+
+### RV32I 整数指令（opcode 映射）
+| Opcode | 指令 |
+|--------|------|
+| 0x37 | LUI |
+| 0x17 | AUIPC |
+| 0x6F | JAL |
+| 0x67 | JALR |
+| 0x63 | BEQ/BNE/BLT/BGE/BLTU/BGEU (funct3 区分) |
+| 0x03 | LB/LH/LW/LBU/LHU (funct3 区分) |
+| 0x23 | SB/SH/SW (funct3 区分) |
+| 0x13 | ADDI/SLTI/SLTIU/XORI/ORI/ANDI/SLLI/SRLI/SRAI (funct3 区分) |
+| 0x33 | ADD/SUB/SLL/SLT/SLTU/XOR/SRL/SRA/OR/AND (funct3+funct7 区分) |
+| 0x73 | EBREAK/CSRRW/CSRRS/CSRRC/CSRRWI/CSRRSI/CSRRCI |
+
+CSR 支持：mhartid(0xF14, RO), fflags(0x001, R/W), frm(0x002, R/W), fcsr(0x003, R/W)
+
+### RV32F 浮点指令（opcode 0x53, OP_FP）
+| funct7 | 指令 |
+|--------|------|
+| 0x00 | FADD.S |
+| 0x04 | FSUB.S |
+| 0x08 | FMUL.S |
+| 0x0C | FDIV.S |
+| 0x2C | FSQRT.S (rs2=0) |
+| 0x10 | FSGNJ.S/FSGNJN.S/FSGNJX.S (funct3 区分) |
+| 0x14 | FMIN.S/FMAX.S (funct3 区分) |
+| 0x50 | FEQ.S/FLT.S/FLE.S (funct3 区分) |
+| 0x60 | FCVT.W.S (rs2=0)/FCVT.WU.S (rs2=1) |
+| 0x68 | FCVT.S.W (rs2=0)/FCVT.S.WU (rs2=1) |
+| 0x70 | FMV.X.W (funct3=0)/FCLASS.S (funct3=1) |
+| 0x78 | FMV.W.X (funct3=0) |
+
+融合乘加（opcode 区分）：
+| opcode | 指令 |
+|--------|------|
+| 0x43 | FMADD.S |
+| 0x47 | FMSUB.S |
+| 0x4B | FNMSUB.S |
+| 0x4F | FNMADD.S |
+
+访存：FLW(opcode 0x07), FSW(opcode 0x27)
+
+### 低精度浮点扩展（自定义，opcode 0x53）
+
+**BF16 (funct7=0x22)**：sign(1)+exp(8,bias=127)+mantissa(7)=16bit
+- rs2=0: FCVT.S.BF16 — BF16→FP32（低16位补0扩展）
+- rs2=1: FCVT.BF16.S — FP32→BF16（截断低16位mantissa）
+
+**FP8 E4M3 (funct7=0x24, rs2=0/1)**：sign(1)+exp(4,bias=7)+mantissa(3)=8bit, max=±448, 无Inf
+- rs2=0: FCVT.S.E4M3 — E4M3→FP32（经BF16中转：e4m3→bf16→fp32）
+- rs2=1: FCVT.E4M3.S — FP32→E4M3（饱和：超出±448→±448，±Inf→±448）
+
+**FP8 E5M2 (funct7=0x24, rs2=2/3)**：sign(1)+exp(5,bias=15)+mantissa(2)=8bit, 有Inf/NaN
+- rs2=2: FCVT.S.E5M2 — E5M2→FP32（经BF16中转）
+- rs2=3: FCVT.E5M2.S — FP32→E5M2（饱和：超出范围→max finite，Inf保持Inf）
+
+**FP4 E2M1 (funct7=0x26)**：sign(1)+exp(2,bias=1)+mantissa(1)=4bit, max=±6.0, 无Inf/NaN
+- 可表示正值：0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0
+- rs2=0: FCVT.S.E2M1 — E2M1→FP32（链：E2M1→E4M3→BF16→FP32）
+- rs2=1: FCVT.E2M1.S — FP32→E2M1（**手写阈值舍入**，饱和到±6.0，NaN/Inf→±6.0）
+
+## 17 道测题速查
+
+| # | 名称 | 验证内容 | 核心实现 |
+|---|------|----------|----------|
+| 1 | device-id | DEV_ID=0x47505055, VERSION=0x00010000 | ctrl_read |
+| 2 | vram-size | VRAM_SIZE = 64MB | ctrl_read |
+| 3 | global-ctrl | STATUS.READY=1, ENABLE 可写读回 | ctrl_read/write |
+| 4 | dispatch-regs | Grid/Block 维度可写可读 | ctrl_read/write |
+| 5 | vram-access | BAR2 读写 0xDEADBEEF 等 | vram_read/write |
+| 6 | dma-regs | DMA SRC/DST/SIZE 可配置 | ctrl_read/write |
+| 7 | irq-regs | IRQ_ENABLE 可写, STATUS 初始 0 | ctrl_read/write |
+| 8 | simt-thread-id | thread_id x/y/z 初始0可写读 | ctrl_read/write |
+| 9 | simt-block-id | block_id x/y/z 可写读 | ctrl_read/write |
+| 10 | simt-warp-lane | warp_id/lane_id 可写读 | ctrl_read/write |
+| 11 | simt-thread-mask | thread_mask 初始0可写读 | ctrl_read/write |
+| 12 | simt-reset | 软复位清零 SIMT | ctrl_write(GLOBAL_CTRL.RESET) |
+| 13 | kernel-exec | RV32I: C[tid]=tid, 8线程 | exec_kernel+exec_warp |
+| 14 | fp-kernel-exec | RV32F: output[tid]=2*tid+1, 8线程 | exec_warp(RV32F) |
+| 15 | lp-convert | BF16/E4M3 往返转换, 4线程 | exec_warp(LP-FP) |
+| 16 | lp-convert-e5m2-e2m1 | E5M2/E2M1 往返+负数, 1线程 | exec_warp(LP-FP) |
+| 17 | lp-convert-saturate | 零值/溢出/Inf 饱和, 1线程 | exec_warp(LP-FP) |
+
+## 实施流程（推荐顺序）
+
+1. **实现 `gpgpu_vram_read/write`** → 通过测试 5
+2. **实现 `gpgpu_ctrl_read/write`**（不含 DISPATCH/DMA_CTRL 触发逻辑） → 通过测试 1-4, 6-7
+3. **实现 `gpgpu_ctrl_write` 的 DISPATCH/DMA_CTRL 触发 + `gpgpu_dma_complete`/`gpgpu_kernel_complete`** → 通过测试 12
+4. **实现 `gpgpu_core_init_warp`** → 基础设施
+5. **实现 `gpgpu_core_exec_warp`（RV32I 部分）** → 通过测试 13
+6. **扩展 `gpgpu_core_exec_warp`（RV32F 部分）** → 通过测试 14
+7. **扩展 `gpgpu_core_exec_warp`（低精度浮点 BF16/E4M3/E5M2/E2M1）** → 通过测试 15-17
+
+## 预期结果
+
+- 17 道测题全部 PASS
+- `make -f Makefile.camp test-gpgpu` 输出 17 个 `ok`
+- 评分：100 分
+
+## 编码注意事项
+
+- 使用 QEMU 的 `fpu/softfloat.h` API 进行浮点运算（如 `float32_add`/`float32_mul` 等），不要直接用 C float 运算
+- E2M1 的 FP32→E2M1 转换必须手写阈值舍入实现，不能用 softfloat
+- MMIO 访问均为 32-bit 对齐（min=4, max=4），VRAM 支持 1-8 字节
+- DMA 使用 `cpu_physical_memory_rw` 进行主机内存访问
+- 中断触发使用 `msix_notify(pdev, vector)` 或 `msi_notify(pdev, vector)`
+- 所有寄存器小端序
+- `x0` 寄存器恒为 0（写入无效）
+- Warp 执行超时阈值 100000 周期
